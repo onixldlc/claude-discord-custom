@@ -1169,6 +1169,14 @@ process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 process.on('SIGHUP', shutdown)
 
+// A broker hosted by a window must not outlive it, or the next window could not take over.
+const hostPid = Number(process.env.DISCORD_BROKER_PARENT ?? 0)
+if (hostPid) {
+  setInterval(() => {
+    if (process.ppid !== hostPid) shutdown()
+  }, 1000).unref()
+}
+
 client.login(TOKEN).catch(err => {
   process.stderr.write(`broker: login failed: ${err}\n`)
   process.exit(1)

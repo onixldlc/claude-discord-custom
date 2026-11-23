@@ -4,7 +4,9 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 
-export const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord-rooms')
+// Every window can host the broker, so this folder is reachable by every agent.
+export const SHARED_DIR = process.env.DISCORD_SHARED_DIR ?? join(homedir(), '.claude', 'channels', 'discord-rooms')
+export const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(SHARED_DIR, 'state')
 export const ACCESS_FILE = join(STATE_DIR, 'access.json')
 export const BINDINGS_FILE = join(STATE_DIR, 'bindings.json')
 export const ROOM_SESSIONS_FILE = join(STATE_DIR, 'room-sessions.json')
@@ -12,8 +14,6 @@ export const APPROVED_DIR = join(STATE_DIR, 'approved')
 export const INBOX_DIR = join(STATE_DIR, 'inbox')
 export const ENV_FILE = join(STATE_DIR, '.env')
 
-// Reachable from every agent container. The token and access list must never live here.
-export const SHARED_DIR = process.env.DISCORD_SHARED_DIR ?? join(homedir(), '.claude', 'channels', 'discord-rooms')
 export const BUS_DIR = join(SHARED_DIR, 'bus')
 export const BUSY_DIR = join(SHARED_DIR, 'busy')
 export const SESSIONS_DIR = join(SHARED_DIR, 'sessions')

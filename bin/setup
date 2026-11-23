@@ -7,7 +7,6 @@ cd "$ROOT"
 export PATH="$ROOT/.local/bin:$PATH"
 
 command -v bun >/dev/null || { echo "Bun is required: https://bun.sh" >&2; exit 1; }
-command -v tmux >/dev/null || { echo "tmux is required to run the broker" >&2; exit 1; }
 
 mkdir -p .local/bin
 if [ ! -x .local/bin/bun ]; then
@@ -15,4 +14,4 @@ if [ ! -x .local/bin/bun ]; then
 fi
 
 bun install --frozen-lockfile
-echo "Ready. Next: bin/rooms init"
+echo "Dependencies ready."

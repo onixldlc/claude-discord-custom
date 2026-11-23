@@ -10,6 +10,11 @@ usage() {
   exit 1
 }
 
+command -v tmux >/dev/null || {
+  echo "Named agents need tmux, which is optional and not installed. Normal Claude windows work without it." >&2
+  exit 1
+}
+
 [ $# -ge 1 ] || usage
 name="$1"
 shift

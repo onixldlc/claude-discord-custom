@@ -8,12 +8,13 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { execFile } from 'child_process'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { randomBytes } from 'crypto'
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { promisify } from 'util'
 import { z } from 'zod'
 import { connectBus, type BusSocket } from './bus.ts'
-import { AGENT_NAME_RE, BUS_DIR, BUSY_DIR, FAILED_DIR, SESSIONS_DIR } from './state.ts'
+import { AGENT_NAME_RE, BUS_DIR, BUSY_DIR, ENV_FILE, FAILED_DIR, SESSIONS_DIR, STATE_DIR } from './state.ts'
 
 const run = promisify(execFile)
 
@@ -247,11 +248,118 @@ function onFrame(frame: any): void {
   }
 }
 
+const HOST_LOCK = join(BUS_DIR, 'host.lock')
+const HOST_COOLDOWN = join(BUS_DIR, 'host.cooldown')
+const HOST_ID = `${process.pid}-${randomBytes(6).toString('hex')}`
+const HOST_LOCK_STALE_MS = 5_000
+const HOST_SETTLE_MS = 300
+// A broker that dies this quickly likely has a bad token, so windows must not hammer Discord's login.
+const HOST_FAST_FAIL_MS = 15_000
+const HOST_COOLDOWN_MS = 30_000
+
+let hostedBroker: ReturnType<typeof Bun.spawn> | null = null
+let hostBeat: Timer | null = null
+let claimingHost = false
+
+function ageMs(path: string): number {
+  try {
+    return Date.now() - statSync(path).mtimeMs
+  } catch {
+    return Infinity
+  }
+}
+
+function hasToken(): boolean {
+  try {
+    return /^DISCORD_BOT_TOKEN=.+/m.test(readFileSync(ENV_FILE, 'utf8'))
+  } catch {
+    return false
+  }
+}
+
+function ownsHostLock(): boolean {
+  try {
+    return readFileSync(HOST_LOCK, 'utf8') === HOST_ID
+  } catch {
+    return false
+  }
+}
+
+function releaseHostLock(): void {
+  if (hostBeat) clearInterval(hostBeat)
+  hostBeat = null
+  if (ownsHostLock()) rmSync(HOST_LOCK, { force: true })
+}
+
+function claimHostLock(): boolean {
+  try {
+    mkdirSync(BUS_DIR, { recursive: true, mode: 0o700 })
+    if (ageMs(HOST_LOCK) > HOST_LOCK_STALE_MS && ageMs(HOST_LOCK) !== Infinity) {
+      const stale = `${HOST_LOCK}.${HOST_ID}`
+      renameSync(HOST_LOCK, stale)
+      rmSync(stale, { force: true })
+    }
+    writeFileSync(HOST_LOCK, HOST_ID, { flag: 'wx', mode: 0o600 })
+    return true
+  } catch {
+    return false
+  }
+}
+
+function startHostedBroker(): void {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  const log = openSync(join(STATE_DIR, 'broker.log'), 'a', 0o600)
+  const startedAt = Date.now()
+  // stdout is this process's MCP channel, so the broker must never inherit it.
+  const child = Bun.spawn([process.execPath, join(import.meta.dir, 'broker.ts')], {
+    cwd: import.meta.dir,
+    env: { ...process.env, DISCORD_BROKER_PARENT: String(process.pid) },
+    stdin: 'ignore',
+    stdout: 'ignore',
+    stderr: log,
+  })
+  closeSync(log)
+  hostedBroker = child
+  hostBeat = setInterval(() => {
+    try {
+      const now = new Date()
+      utimesSync(HOST_LOCK, now, now)
+    } catch {}
+  }, 1_000)
+  hostBeat.unref()
+  void child.exited.then(() => {
+    hostedBroker = null
+    if (!shuttingDown && Date.now() - startedAt < HOST_FAST_FAIL_MS) {
+      try { writeFileSync(HOST_COOLDOWN, '', { mode: 0o600 }) } catch {}
+    }
+    releaseHostLock()
+  })
+}
+
+/** Starts the broker from this window when none is running. Exactly one window wins the lock. */
+function hostBrokerIfNeeded(): void {
+  if (HAS_FIXED_NAME || hostedBroker || claimingHost || shuttingDown) return
+  if (ageMs(HOST_COOLDOWN) < HOST_COOLDOWN_MS || !hasToken() || !claimHostLock()) return
+  claimingHost = true
+  // A second window clearing the same stale lock would overwrite ours, so confirm before starting.
+  setTimeout(() => {
+    claimingHost = false
+    if (shuttingDown || !ownsHostLock()) return
+    try {
+      startHostedBroker()
+    } catch (err) {
+      process.stderr.write(`discord-rooms: could not start broker: ${err}\n`)
+      releaseHostLock()
+    }
+  }, HOST_SETTLE_MS).unref()
+}
+
 function connect(): void {
   if (shuttingDown) return
   let buffer = ''
   const sock = connectBus(BUS_DIR)
   if (!sock) {
+    hostBrokerIfNeeded()
     setTimeout(connect, RECONNECT_MS).unref()
     return
   }
@@ -322,6 +430,8 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   socket?.destroy()
+  hostedBroker?.kill('SIGTERM')
+  releaseHostLock()
   process.exit(0)
 }
 process.stdin.on('end', shutdown)

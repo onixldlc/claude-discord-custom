@@ -4,7 +4,9 @@ set -euo pipefail
 
 SELF="$(readlink -f "$0")"
 ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
-STATE="$ROOT/.local/state"
+SHARED="${DISCORD_SHARED_DIR:-$HOME/.claude/channels/discord-rooms}"
+STATE="$SHARED/state"
+OLD_STATE="$ROOT/.local/state"
 
 if [ -z "${ROOMS_CLEAN:-}" ]; then
   exec env -i \
@@ -17,7 +19,7 @@ if [ -z "${ROOMS_CLEAN:-}" ]; then
     PATH="$ROOT/.local/bin:$PATH" \
     DISCORD_STATE_DIR="$STATE" \
     DISCORD_TMUX_COMMANDS="${DISCORD_TMUX_COMMANDS:-}" \
-    DISCORD_SHARED_DIR="${DISCORD_SHARED_DIR:-$HOME/.claude/channels/discord-rooms}" \
+    DISCORD_SHARED_DIR="$SHARED" \
     "$SELF" "$@"
 fi
 
@@ -25,8 +27,9 @@ usage() {
   cat >&2 <<'EOF'
 usage: bin/rooms <command>
 
+  install                      first-time setup: asks for the token, installs the plugin
   init                         create the private token file
-  up                           start the broker
+  up                           start the broker by hand (windows normally do this)
   agent <name> [dir] [-- args] start a Claude agent
   install-shared               copy the agent side to ~/.claude for other containers
   attach <name>                open an agent (detach with Ctrl-b d)
@@ -41,31 +44,112 @@ EOF
 
 init_state() {
   mkdir -p "$STATE"
-  chmod 700 "$STATE"
+  chmod 700 "$SHARED" "$STATE"
+  # Carries over a token, users, and room locks from the older project-local layout.
+  for file in .env access.json bindings.json room-sessions.json; do
+    if [ -s "$OLD_STATE/$file" ] && [ ! -s "$STATE/$file" ]; then
+      install -m 600 "$OLD_STATE/$file" "$STATE/$file"
+    fi
+  done
   [ -e "$STATE/.env" ] || install -m 600 /dev/null "$STATE/.env"
+}
+
+has_token() {
+  grep -qE '^DISCORD_BOT_TOKEN=.+' "$STATE/.env"
+}
+
+has_tmux() {
+  command -v tmux >/dev/null
+}
+
+need_tmux() {
+  has_tmux && return 0
+  echo "'$1' needs tmux, which is optional and not installed. Normal Claude windows work without it." >&2
+  exit 1
+}
+
+# True for a broker hosted anywhere: a window, tmux, or the background fallback.
+broker_alive() {
+  local beat
+  beat="$(stat -c %Y "$SHARED/bus/broker-alive" 2>/dev/null)" || return 1
+  [ $(($(date +%s) - beat)) -lt 5 ]
+}
+
+background_pid() {
+  local pid
+  pid="$(cat "$STATE/broker.pid" 2>/dev/null)" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  # Guards against a reused PID belonging to some other program.
+  tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'broker\.ts' || return 1
+  echo "$pid"
+}
+
+stop_background() {
+  local pid
+  if pid="$(background_pid)"; then
+    kill "$pid"
+    echo "stopped background broker"
+  fi
+  rm -f "$STATE/broker.pid"
+}
+
+broker_started() {
+  if has_tmux; then
+    tmux has-session -t '=discord-broker' 2>/dev/null
+  else
+    background_pid >/dev/null
+  fi
+}
+
+ask_token() {
+  has_token && return 0
+  [ -t 0 ] || { echo "No token. Run bin/rooms install in a terminal." >&2; exit 1; }
+  printf 'Paste Discord bot token (hidden): ' >&2
+  IFS= read -rs token
+  printf '\n' >&2
+  [ -n "$token" ] || { echo "No token entered." >&2; exit 1; }
+  printf 'DISCORD_BOT_TOKEN=%s\n' "$token" >> "$STATE/.env"
+  unset token
 }
 
 command="${1:-}"
 [ $# -eq 0 ] || shift
 
 case "$command" in
+  install)
+    "$ROOT/bin/setup"
+    init_state
+    ask_token
+    "$ROOT/bin/install-shared"
+    # A broker from the older layout reads old state, so let the next window start a fresh one.
+    stop_background
+    if has_tmux && tmux has-session -t '=discord-broker' 2>/dev/null; then
+      tmux kill-session -t '=discord-broker'
+      echo "Stopped old broker. The next window starts a new one."
+    fi
+    ;;
   init)
     init_state
     echo "Add DISCORD_BOT_TOKEN=... to: $STATE/.env"
     ;;
   up)
     init_state
-    if ! grep -qE '^DISCORD_BOT_TOKEN=.+' "$STATE/.env"; then
+    if ! has_token; then
       echo "No token. Add DISCORD_BOT_TOKEN=... to: $STATE/.env" >&2
       exit 1
     fi
-    if tmux has-session -t '=discord-broker' 2>/dev/null; then
+    if broker_alive; then
       echo "broker already running"
       exit 0
     fi
-    tmux new-session -d -s discord-broker -c "$ROOT" "exec bun broker.ts 2>>'$STATE/broker.log'"
+    if has_tmux; then
+      tmux new-session -d -s discord-broker -c "$ROOT" "exec bun broker.ts 2>>'$STATE/broker.log'"
+    else
+      (cd "$ROOT" && exec setsid nohup bun broker.ts </dev/null >/dev/null 2>>"$STATE/broker.log") &
+      echo "$!" > "$STATE/broker.pid"
+    fi
     timeout 3 tail -f /dev/null || true
-    if ! tmux has-session -t '=discord-broker' 2>/dev/null; then
+    if ! broker_started; then
       echo "broker stopped during startup:" >&2
       tail -n 10 "$STATE/broker.log" >&2
       exit 1
@@ -81,15 +165,17 @@ case "$command" in
     ;;
   attach)
     [ $# -eq 1 ] || usage
+    need_tmux attach
     exec tmux attach -t "=cc-$1"
     ;;
   ps)
-    sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)"
-    if [ -z "$sessions" ]; then
-      echo "nothing running"
-      exit 0
+    printf 'broker: %s\n' "$(broker_alive && echo running || echo stopped)"
+    sessions=""
+    if has_tmux; then
+      sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)"
     fi
-    printf 'broker: %s\n\n' "$(printf '%s\n' "$sessions" | grep -qx discord-broker && echo running || echo stopped)"
+    printf '%s\n' "$sessions" | grep -q '^cc-' || exit 0
+    echo
     printf '%-20s %-10s %-22s %s\n' AGENT SESSION ROOM FOLDER
     for session in $(printf '%s\n' "$sessions" | grep '^cc-' || true); do
       name="${session#cc-}"
@@ -103,10 +189,17 @@ case "$command" in
     tail -n 40 "$STATE/broker.log"
     ;;
   down)
-    for session in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -E '^(cc-|discord-broker$)' || true); do
-      tmux kill-session -t "=$session"
-      echo "stopped $session"
-    done
+    stop_background
+    if has_tmux; then
+      for session in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -E '^(cc-|discord-broker$)' || true); do
+        tmux kill-session -t "=$session"
+        echo "stopped $session"
+      done
+    fi
+    timeout 1 tail -f /dev/null || true
+    if broker_alive; then
+      echo "The bot is hosted by a Claude window. Close the Discord-connected windows to stop it."
+    fi
     ;;
   status|pair|deny|allow|remove|policy)
     exec bun "$ROOT/ctl.ts" "$command" "$@"
