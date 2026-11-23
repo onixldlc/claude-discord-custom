@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# First run after cloning: keeps Bun in .local/ and installs the locked dependencies.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+cd "$ROOT"
+export PATH="$ROOT/.local/bin:$PATH"
+
+command -v bun >/dev/null || { echo "Bun is required: https://bun.sh" >&2; exit 1; }
+command -v tmux >/dev/null || { echo "tmux is required to run the broker" >&2; exit 1; }
+
+mkdir -p .local/bin
+if [ ! -x .local/bin/bun ]; then
+  cp "$(readlink -f "$(command -v bun)")" .local/bin/bun
+fi
+
+bun install --frozen-lockfile
+echo "Ready. Next: bin/rooms init"

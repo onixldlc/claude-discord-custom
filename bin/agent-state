@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Claude Code hook: records whether this agent is mid-turn and its session ID.
+set -eu
+
+input="$(cat)"
+base="${DISCORD_STATE_DIR:-$HOME/.claude/channels/discord-rooms}"
+dir="$base/busy"
+hook_dir=/tmp/discord-rooms
+
+# Plugin hooks get no agent name, so find the owning Claude process instead.
+claude_pid() {
+  local pid=$PPID exe
+  while [ "$pid" -gt 1 ]; do
+    exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+    case "${exe##*/}" in claude*) echo "$pid"; return 0 ;; esac
+    pid="$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)"
+  done
+  exe="$(readlink /proc/1/exe 2>/dev/null || true)"
+  case "${exe##*/}" in claude*) echo 1 ;; esac
+}
+
+owner=""
+name="${CC_AGENT_NAME:-}"
+if [ -z "$name" ]; then
+  owner="$(claude_pid)"
+  [ -n "$owner" ] || exit 0
+  name="$(cat "$hook_dir/$owner.name" 2>/dev/null || true)"
+fi
+
+case "${1:-}" in
+  busy)
+    [ -n "$name" ] || exit 0
+    mkdir -p "$dir"
+    : > "$dir/$name"
+    ;;
+  idle)
+    [ -n "$name" ] || exit 0
+    rm -f "$dir/$name"
+    ;;
+  failed)
+    [ -n "$name" ] || exit 0
+    rm -f "$dir/$name"
+    mkdir -p "$base/failed"
+    : > "$base/failed/$name"
+    ;;
+  session)
+    id="$(printf '%s' "$input" | sed -nE 's/.*"session_id"[[:space:]]*:[[:space:]]*"([A-Za-z0-9_-]+)".*/\1/p' | head -n 1)"
+    if [ -n "$id" ]; then
+      if [ -n "$owner" ]; then
+        mkdir -p "$hook_dir"
+        printf '%s\n' "$id" > "$hook_dir/$owner.session"
+      fi
+      if [ -n "$name" ]; then
+        mkdir -p "$base/sessions"
+        printf '%s\n' "$id" > "$base/sessions/$name"
+      fi
+    fi
+    ;;
+  allow-reply)
+    [ -n "$name" ] || exit 0
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"discord-rooms reply"}}'
+    ;;
+  *)
+    echo "usage: agent-state busy|idle|failed|session|allow-reply" >&2
+    exit 1
+    ;;
+esac

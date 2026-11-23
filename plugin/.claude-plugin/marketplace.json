@@ -1,0 +1,11 @@
+{
+  "name": "discord-rooms",
+  "owner": { "name": "local" },
+  "plugins": [
+    {
+      "name": "discord-rooms",
+      "source": "./",
+      "description": "One Discord bot for many Claude Code sessions, each locked to its own channel or thread."
+    }
+  ]
+}

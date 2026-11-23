@@ -1,0 +1,9 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "\"$HOME/.claude/channels/discord-rooms/app/bin/agent-state\" busy" }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "\"$HOME/.claude/channels/discord-rooms/app/bin/agent-state\" idle" }] }],
+    "StopFailure": [{ "hooks": [{ "type": "command", "command": "\"$HOME/.claude/channels/discord-rooms/app/bin/agent-state\" failed" }] }],
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "\"$HOME/.claude/channels/discord-rooms/app/bin/agent-state\" session" }] }],
+    "PreToolUse": [{ "matcher": "mcp__plugin_discord-rooms_discord-rooms__reply", "hooks": [{ "type": "command", "command": "\"$HOME/.claude/channels/discord-rooms/app/bin/agent-state\" allow-reply" }] }]
+  }
+}

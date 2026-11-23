@@ -1,0 +1,3 @@
+repo: anthropics/claude-plugins-official
+path: external_plugins/discord
+commit: 73c8cf3ea7e296057b467990f2f5d61b4c922260

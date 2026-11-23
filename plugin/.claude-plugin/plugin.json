@@ -1,0 +1,6 @@
+{
+  "name": "discord-rooms",
+  "description": "One Discord bot for many Claude Code sessions, each locked to its own channel or thread.",
+  "version": "0.1.0",
+  "keywords": ["discord", "channel", "mcp"]
+}

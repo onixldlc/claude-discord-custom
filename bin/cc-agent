@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Start a named Claude Code agent in tmux, connected to the Discord broker.
+# usage: cc-agent <name> [dir] [-- extra claude args]
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+
+usage() {
+  echo "usage: cc-agent <name> [dir] [-- extra claude args]" >&2
+  exit 1
+}
+
+[ $# -ge 1 ] || usage
+name="$1"
+shift
+[[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || { echo "invalid name: use a-z, 0-9, hyphen, max 32" >&2; exit 1; }
+
+dir="$PWD"
+if [ $# -ge 1 ] && [ "$1" != "--" ]; then
+  dir="$1"
+  shift
+fi
+if [ $# -ge 1 ]; then
+  [ "$1" = "--" ] || usage
+  shift
+fi
+[ -d "$dir" ] || { echo "no such directory: $dir" >&2; exit 1; }
+dir="$(cd "$dir" && pwd)"
+state="${DISCORD_SHARED_DIR:-$HOME/.claude/channels/discord-rooms}"
+mkdir -p "$state"
+
+session="cc-$name"
+if tmux has-session -t "=$session" 2>/dev/null; then
+  echo "already running: tmux attach -t $session" >&2
+  exit 1
+fi
+
+config="$(ROOT="$ROOT" bun -e 'console.log(JSON.stringify({mcpServers:{"discord-rooms":{command:"bun",args:[process.env.ROOT+"/server.ts"]}}}))')"
+
+settings="$(ROOT="$ROOT" bun -e 'const hook=s=>[{hooks:[{type:"command",command:JSON.stringify(process.env.ROOT+"/bin/agent-state")+" "+s}]}];console.log(JSON.stringify({permissions:{allow:["mcp__discord-rooms__reply"]},hooks:{UserPromptSubmit:hook("busy"),Stop:hook("idle"),StopFailure:hook("failed"),SessionStart:hook("session")}}))')"
+
+rm -f "$state/busy/$name" "$state/failed/$name" "$state/sessions/$name"
+
+tmux new-session -d -s "$session" -c "$dir" \
+  env CC_AGENT_NAME="$name" DISCORD_STATE_DIR="$state" DISCORD_SHARED_DIR="$state" PATH="$PATH" claude \
+  --settings "$settings" \
+  --mcp-config "$config" \
+  --dangerously-load-development-channels server:discord-rooms \
+  "$@"
+
+echo "started $name. Attach with: tmux attach -t $session"

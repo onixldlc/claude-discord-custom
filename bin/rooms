@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Project-local launcher. Tools and bot state stay in .local/.
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+STATE="$ROOT/.local/state"
+
+if [ -z "${ROOMS_CLEAN:-}" ]; then
+  exec env -i \
+    ROOMS_CLEAN=1 \
+    HOME="$HOME" \
+    USER="${USER:-$(id -un)}" \
+    SHELL="${SHELL:-/bin/bash}" \
+    TERM="${TERM:-xterm-256color}" \
+    LANG="${LANG:-C.UTF-8}" \
+    PATH="$ROOT/.local/bin:$PATH" \
+    DISCORD_STATE_DIR="$STATE" \
+    DISCORD_TMUX_COMMANDS="${DISCORD_TMUX_COMMANDS:-}" \
+    DISCORD_SHARED_DIR="${DISCORD_SHARED_DIR:-$HOME/.claude/channels/discord-rooms}" \
+    "$SELF" "$@"
+fi
+
+usage() {
+  cat >&2 <<'EOF'
+usage: bin/rooms <command>
+
+  init                         create the private token file
+  up                           start the broker
+  agent <name> [dir] [-- args] start a Claude agent
+  install-shared               copy the agent side to ~/.claude for other containers
+  attach <name>                open an agent (detach with Ctrl-b d)
+  ps                           list broker and agents
+  log                          show recent broker log
+  down                         stop the broker and all agents
+
+  status | pair <code> | deny <code> | allow <id> | remove <id> | policy <mode>
+EOF
+  exit 1
+}
+
+init_state() {
+  mkdir -p "$STATE"
+  chmod 700 "$STATE"
+  [ -e "$STATE/.env" ] || install -m 600 /dev/null "$STATE/.env"
+}
+
+command="${1:-}"
+[ $# -eq 0 ] || shift
+
+case "$command" in
+  init)
+    init_state
+    echo "Add DISCORD_BOT_TOKEN=... to: $STATE/.env"
+    ;;
+  up)
+    init_state
+    if ! grep -qE '^DISCORD_BOT_TOKEN=.+' "$STATE/.env"; then
+      echo "No token. Add DISCORD_BOT_TOKEN=... to: $STATE/.env" >&2
+      exit 1
+    fi
+    if tmux has-session -t '=discord-broker' 2>/dev/null; then
+      echo "broker already running"
+      exit 0
+    fi
+    tmux new-session -d -s discord-broker -c "$ROOT" "exec bun broker.ts 2>>'$STATE/broker.log'"
+    timeout 3 tail -f /dev/null || true
+    if ! tmux has-session -t '=discord-broker' 2>/dev/null; then
+      echo "broker stopped during startup:" >&2
+      tail -n 10 "$STATE/broker.log" >&2
+      exit 1
+    fi
+    tail -n 3 "$STATE/broker.log"
+    ;;
+  agent)
+    [ $# -ge 1 ] || usage
+    exec "$ROOT/bin/cc-agent" "$@"
+    ;;
+  install-shared)
+    exec "$ROOT/bin/install-shared"
+    ;;
+  attach)
+    [ $# -eq 1 ] || usage
+    exec tmux attach -t "=cc-$1"
+    ;;
+  ps)
+    sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)"
+    if [ -z "$sessions" ]; then
+      echo "nothing running"
+      exit 0
+    fi
+    printf 'broker: %s\n\n' "$(printf '%s\n' "$sessions" | grep -qx discord-broker && echo running || echo stopped)"
+    printf '%-20s %-10s %-22s %s\n' AGENT SESSION ROOM FOLDER
+    for session in $(printf '%s\n' "$sessions" | grep '^cc-' || true); do
+      name="${session#cc-}"
+      folder="$(tmux display-message -p -t "=$session:" '#{pane_current_path}')"
+      id="$(cut -c1-8 "$DISCORD_SHARED_DIR/sessions/$name" 2>/dev/null || echo unknown)"
+      room="$(sed -nE "s/^[[:space:]]*\"$name\"[[:space:]]*:[[:space:]]*\"([0-9]+)\".*/\1/p" "$STATE/bindings.json" 2>/dev/null || true)"
+      printf '%-20s %-10s %-22s %s\n' "$name" "$id" "${room:-unlocked}" "$folder"
+    done
+    ;;
+  log)
+    tail -n 40 "$STATE/broker.log"
+    ;;
+  down)
+    for session in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -E '^(cc-|discord-broker$)' || true); do
+      tmux kill-session -t "=$session"
+      echo "stopped $session"
+    done
+    ;;
+  status|pair|deny|allow|remove|policy)
+    exec bun "$ROOT/ctl.ts" "$command" "$@"
+    ;;
+  *)
+    usage
+    ;;
+esac

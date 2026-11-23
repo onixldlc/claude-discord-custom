@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Copies only the agent side into the folder every Claude window can reach, then installs
+# the local plugin. The bot token, access list, and broker never go there.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+shared="${DISCORD_SHARED_DIR:-$HOME/.claude/channels/discord-rooms}"
+app="$shared/app"
+
+[ -x "$ROOT/.local/bin/bun" ] && [ -d "$ROOT/node_modules" ] || { echo "Run bin/setup first" >&2; exit 1; }
+
+mkdir -p "$app/bin" "$app/.local/bin"
+chmod 700 "$shared"
+cp "$ROOT/server.ts" "$ROOT/state.ts" "$ROOT/bus.ts" "$ROOT/package.json" "$app/"
+cp "$ROOT/bin/agent-state" "$app/bin/"
+cp "$ROOT/.local/bin/bun" "$app/.local/bin/"
+cp -R "$ROOT/plugin" "$app/"
+cp -a "$ROOT/node_modules" "$app/"
+
+claude plugin marketplace add "$app/plugin" 2>&1 | tail -n 1 || true
+claude plugin install discord-rooms@discord-rooms 2>&1 | tail -n 1 || true
+
+echo "Installed. Start any window with:"
+echo "  claude --settings '{\"autoMemoryEnabled\":false}' --dangerously-load-development-channels plugin:discord-rooms@discord-rooms"

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "discord-rooms": {
+      "command": "sh",
+      "args": ["-c", "exec \"$HOME/.claude/channels/discord-rooms/app/.local/bin/bun\" \"$HOME/.claude/channels/discord-rooms/app/server.ts\""]
+    }
+  }
+}
