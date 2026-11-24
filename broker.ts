@@ -324,6 +324,7 @@ async function waitForSwitch(name: string, command: SessionCommand, before: stri
 
 type StatusWatch = {
   room: string
+  deliveredAt: number
   lastProgress: number
   transcriptMtime?: number
   message?: Message
@@ -337,7 +338,9 @@ const statusWatches = new Map<string, StatusWatch>()
 const failureNotices = new Map<string, Message>()
 
 function watchTurn(name: string, room: string): void {
-  if (!statusWatches.has(name)) statusWatches.set(name, { room, lastProgress: Date.now(), lastEdit: 0, updating: false })
+  const watch = statusWatches.get(name)
+  if (watch) watch.deliveredAt = Date.now()
+  else statusWatches.set(name, { room, deliveredAt: Date.now(), lastProgress: Date.now(), lastEdit: 0, updating: false })
   const notice = failureNotices.get(name)
   if (notice) {
     failureNotices.delete(name)
@@ -403,6 +406,29 @@ function lastApiError(agent: Agent): string | undefined {
   return undefined
 }
 
+/** Backup for a missed Stop hook: Claude's transcript shows the turn ended after our last message. */
+function transcriptTurnEnded(agent: Agent, since: number): boolean {
+  const session = currentSession(agent.name)
+  if (!session) return false
+  try {
+    const path = transcriptPath(agent, session)
+    const size = statSync(path).size
+    const length = Math.min(size, 256 * 1024)
+    const buf = Buffer.alloc(length)
+    const fd = openSync(path, 'r')
+    try { readSync(fd, buf, 0, length, size - length) } finally { closeSync(fd) }
+    for (const line of buf.toString('utf8').split('\n').reverse()) {
+      let entry: any
+      try { entry = JSON.parse(line) } catch { continue }
+      const ended = (entry.type === 'system' && entry.subtype === 'turn_duration')
+        || (entry.type === 'assistant' && entry.message?.stop_reason === 'end_turn')
+      if (ended) return Date.parse(entry.timestamp) >= since
+      if (entry.type === 'user' || entry.type === 'assistant') return false
+    }
+  } catch {}
+  return false
+}
+
 function formatWait(ms: number): string {
   const seconds = Math.round(ms / 1000)
   return seconds < 90 ? `${seconds}s` : `${Math.round(seconds / 60)}m`
@@ -452,6 +478,13 @@ function updateStatuses(): void {
     }
     const waitingOnUser = [...pendingPermissions.keys()].some(key => key.startsWith(`${name}:`))
     const quiet = now - watch.lastProgress
+    // Checked only after a quiet stretch, so a message queued behind the ending turn is not mistaken for idle.
+    if (!waitingOnUser && quiet >= STATUS_AFTER_MS && transcriptTurnEnded(agent, watch.deliveredAt)) {
+      rmSync(busyFile(name), { force: true })
+      statusWatches.delete(name)
+      void clearStatus(watch)
+      continue
+    }
     if (waitingOnUser) {
       if (watch.message) void showStatus(watch, `🙋 \`${name}\` is waiting for your answer on the permission prompt.`, true)
     } else if (quiet >= STATUS_STUCK_MS) {
@@ -886,10 +919,47 @@ function roomLabel(name: string, here: string): string {
   return channel && 'name' in channel && channel.name ? `#${channel.name}` : 'another room'
 }
 
+const TITLE_SCAN_BYTES = 1024 * 1024
+const titleCache = new Map<string, { mtimeMs: number; title: string }>()
+
+/** The name Claude shows in its session list: a /rename title, otherwise its generated title. */
+function sessionTitle(agent: Agent): string {
+  const session = currentSession(agent.name)
+  if (!session) return ''
+  const cached = titleCache.get(session)
+  try {
+    const path = transcriptPath(agent, session)
+    const { size, mtimeMs } = statSync(path)
+    if (cached?.mtimeMs === mtimeMs) return cached.title
+    const length = Math.min(size, TITLE_SCAN_BYTES)
+    const buf = Buffer.alloc(length)
+    const fd = openSync(path, 'r')
+    try { readSync(fd, buf, 0, length, size - length) } finally { closeSync(fd) }
+    let custom = ''
+    let generated = ''
+    for (const line of buf.toString('utf8').split('\n')) {
+      if (!line.includes('-title"')) continue
+      try {
+        const entry = JSON.parse(line)
+        if (entry.type === 'custom-title' && typeof entry.customTitle === 'string') custom = entry.customTitle
+        if (entry.type === 'ai-title' && typeof entry.aiTitle === 'string') generated = entry.aiTitle
+      } catch {}
+    }
+    // Titles come from transcript text, so they must not be able to break formatting or ping anyone.
+    const title = (custom || generated).replace(/`/g, '').replace(/\s+/g, ' ').trim() || cached?.title || ''
+    titleCache.set(session, { mtimeMs, title })
+    return title
+  } catch {
+    return cached?.title ?? ''
+  }
+}
+
 function describeAgent(agent: Agent, here: string): string {
   const room = bindings[agent.name]
   const where = room === here ? 'this room' : room ? `<#${room}>` : 'free'
-  return `\`${agent.name}\` · ${agentStatus(agent.name)} · ${where}\n-# folder \`${agent.cwd}\` · session \`${shortSession(agent.name)}\``
+  const title = sessionTitle(agent)
+  const label = title ? ` · \`${title.slice(0, 80)}\`` : ''
+  return `\`${agent.name}\`${label} · ${agentStatus(agent.name)} · ${where}\n-# folder \`${agent.cwd}\` · session \`${shortSession(agent.name)}\``
 }
 
 function describeAgents(here: string): string {
@@ -1002,13 +1072,16 @@ async function onAutocomplete(i: AutocompleteInteraction): Promise<void> {
   }
   const query = i.options.getFocused().toLowerCase()
   const choices = [...agents.values()]
-    .filter(agent => agent.name.includes(query) || agent.cwd.toLowerCase().includes(query))
+    .filter(agent => agent.name.includes(query) || agent.cwd.toLowerCase().includes(query) || sessionTitle(agent).toLowerCase().includes(query))
     .sort((a, b) => a.name.localeCompare(b.name))
     .slice(0, 25)
-    .map(agent => ({
-      name: `${agent.name} · ${agentStatus(agent.name)} · ${roomLabel(agent.name, i.channelId)} · ${shortFolder(agent.cwd)}`.slice(0, 100),
-      value: agent.name,
-    }))
+    .map(agent => {
+      const title = sessionTitle(agent)
+      const details = `${agentStatus(agent.name)} · ${roomLabel(agent.name, i.channelId)}`
+      // Discord cuts choices at 100 characters, so the title goes before the folder.
+      const label = title ? `${agent.name} · ${title.slice(0, 55)} · ${details}` : `${agent.name} · ${details} · ${shortFolder(agent.cwd)}`
+      return { name: label.slice(0, 100), value: agent.name }
+    })
   await i.respond(choices)
 }
 

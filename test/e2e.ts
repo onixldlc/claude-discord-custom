@@ -3,7 +3,7 @@
 
 import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs'
 import { join, resolve } from 'path'
 
 const ROOT = resolve(import.meta.dir, '..')
@@ -299,6 +299,32 @@ async function main(): Promise<void> {
   check('next message clears failure notice', await until(async () => (await events()).some(e => e.kind === 'delete' && e.message === failure?.id)))
   setIdle('beta')
   await sleep(1200)
+  const seenMissed = (await events()).length
+  await say('t-2', 'stop hook never fires')
+  const missed = await until(async () => (await events()).slice(seenMissed).find(e => e.kind === 'send' && e.content.startsWith('⏳')))
+  check('unfinished turn still shows status', missed)
+  writeFileSync(errorFile, readFileSync(errorFile, 'utf8') + JSON.stringify({ type: 'system', subtype: 'turn_duration', timestamp: new Date().toISOString() }) + '\n')
+  check('finished turn removes status without Stop hook', await until(async () => (await events()).slice(seenMissed).some(e => e.kind === 'delete' && e.message === missed?.id)))
+  check('finished turn clears busy without Stop hook', await until(() => !existsSync(join(STATE, 'busy', 'beta'))))
+  const afterMissed = (await events()).length
+  await sleep(1200)
+  check('finished turn posts no new status', !(await events()).slice(afterMissed).some(e => e.kind === 'send' && e.content.startsWith('⏳')))
+
+  console.log('\nsession titles')
+  writeFileSync(errorFile, readFileSync(errorFile, 'utf8') + JSON.stringify({ type: 'ai-title', aiTitle: 'Figma comments on `page`\ntest', sessionId: S4 }) + '\n')
+  const byTitle = await ctrl({ op: 'autocomplete', room: 't-1', user: OWNER, query: 'figma' })
+  check('picker finds agent by title', byTitle.length === 1 && byTitle[0].value === 'beta', byTitle)
+  check('picker shows clean title', byTitle[0]?.name.startsWith('beta · Figma comments on page test ·'), byTitle)
+  check('list shows title', (await cmd('c-any', 'use-agent')).text?.includes('`Figma comments on page test`'))
+  await sleep(20)
+  writeFileSync(errorFile, readFileSync(errorFile, 'utf8') + JSON.stringify({ type: 'custom-title', customTitle: 'My renamed session', sessionId: S4 }) + '\n')
+  const renamed = await ctrl({ op: 'autocomplete', room: 't-1', user: OWNER, query: 'renamed' })
+  check('renamed title wins', renamed[0]?.name.startsWith('beta · My renamed session ·'), renamed)
+  const longTitle = 'x'.repeat(300)
+  await sleep(20)
+  writeFileSync(errorFile, readFileSync(errorFile, 'utf8') + JSON.stringify({ type: 'custom-title', customTitle: longTitle, sessionId: S4 }) + '\n')
+  const long = await ctrl({ op: 'autocomplete', room: 't-1', user: OWNER, query: 'xxx' })
+  check('long title fits Discord limit', long[0]?.name.length <= 100 && long[0]?.value === 'beta', long)
 
   console.log('\nthread lifecycle')
   await ctrl({ op: 'threadArchive', room: 't-2' })

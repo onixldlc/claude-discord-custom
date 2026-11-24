@@ -3,20 +3,33 @@
 set -eu
 
 input="$(cat)"
-base="${DISCORD_STATE_DIR:-$HOME/.claude/channels/discord-rooms}"
+base="${DISCORD_SHARED_DIR:-$HOME/.claude/channels/discord-rooms}"
 dir="$base/busy"
 hook_dir=/tmp/discord-rooms
 
 # Plugin hooks get no agent name, so find the owning Claude process instead.
+is_claude() {
+  local exe script
+  exe="$(readlink "/proc/$1/exe" 2>/dev/null || true)"
+  # Native installs run from .../claude/versions/<version>, so the file name alone is not enough.
+  case "$exe" in */claude/versions/*) return 0 ;; esac
+  case "${exe##*/}" in
+    claude*) return 0 ;;
+    node|bun)
+      script="$(tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null | sed -n 2p || true)"
+      case "$script" in *claude*) return 0 ;; esac
+      ;;
+  esac
+  return 1
+}
+
 claude_pid() {
-  local pid=$PPID exe
+  local pid=$PPID
   while [ "$pid" -gt 1 ]; do
-    exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
-    case "${exe##*/}" in claude*) echo "$pid"; return 0 ;; esac
+    if is_claude "$pid"; then echo "$pid"; return 0; fi
     pid="$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)"
   done
-  exe="$(readlink /proc/1/exe 2>/dev/null || true)"
-  case "${exe##*/}" in claude*) echo 1 ;; esac
+  if is_claude 1; then echo 1; fi
 }
 
 owner=""

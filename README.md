@@ -156,7 +156,7 @@ If you previously started the bot with `bin/rooms up`:
 
 | Command | Effect |
 | --- | --- |
-| `/use-agent` | List running agents |
+| `/use-agent` | List running agents with their session titles. While typing, search by title, name, or folder |
 | `/use-agent <name>` | Lock agent to this room, moving it if it was elsewhere |
 | `/rem-agent` | Unlock this room, agent keeps running |
 
